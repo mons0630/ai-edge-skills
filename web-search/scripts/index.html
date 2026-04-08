@@ -9,53 +9,37 @@
   /**
    * Web Search skill for AI Edge Gallery.
    *
-   * Strategy (all CORS-safe, no API key required):
-   *   1. Jina AI Search API  (s.jina.ai) — returns structured Markdown
-   *      with titles, URLs and summaries for the top results.
-   *   2. DuckDuckGo Instant Answer API — JSONP-style, works from browser
-   *      when the &callback= param is omitted and origin is trusted.
-   *      Used as a lightweight fallback for factual/entity queries.
+   * Zero API key. All endpoints send Access-Control-Allow-Origin: *
    *
-   * Both endpoints respond with Access-Control-Allow-Origin: *
+   * Layer 1 — DuckDuckGo Instant Answer API
+   *   Works for entity lookups, definitions, known facts.
+   *   Returns AbstractText + RelatedTopics.
+   *
+   * Layer 2 — Wikipedia OpenSearch + Summary API
+   *   Fills in when DDG returns nothing.
+   *   Two calls: opensearch (titles) → summary (extract).
+   *
+   * Layer 3 — Jina Reader on a Google search URL
+   *   r.jina.ai is free + no key + CORS-safe.
+   *   We pass it a Google search results URL so it fetches
+   *   and extracts the page text, giving us live web snippet context.
+   *   This covers news, prices, current events that DDG/Wiki miss.
    */
 
-  /* ── 1. Jina Search (primary) ─────────────────────────────────────── */
-  async function searchJina(query, topK) {
-    // s.jina.ai wraps a Google search and returns clean Markdown.
-    // Accept: application/json returns structured JSON instead of Markdown.
-    const url = `https://s.jina.ai/${encodeURIComponent(query)}`;
-    const res = await fetch(url, {
-      headers: {
-        'Accept': 'application/json',
-        'X-Retain-Images': 'none',
-        'X-No-Cache': 'true'
-      }
-    });
-    if (!res.ok) throw new Error(`Jina Search error: ${res.status}`);
-    const data = await res.json();
-
-    // Jina returns { data: [ { title, url, description, content }, ... ] }
-    const items = (data.data || []).slice(0, topK);
-    return items.map(item => ({
-      title:   item.title   || '(no title)',
-      url:     item.url     || '',
-      snippet: item.description || (item.content || '').substring(0, 300)
-    }));
-  }
-
-  /* ── 2. DuckDuckGo Instant Answer (fallback) ──────────────────────── */
-  async function searchDDGInstant(query, topK) {
+  /* ── Layer 1: DuckDuckGo Instant Answer ──────────────────────────── */
+  async function searchDDG(query, topK) {
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`DDG API error: ${res.status}`);
+    if (!res.ok) throw new Error(`DDG: ${res.status}`);
     const data = await res.json();
-
     const results = [];
+
     if (data.AbstractText) {
       results.push({
         title:   data.Heading || query,
         url:     data.AbstractURL || '',
-        snippet: data.AbstractText
+        snippet: data.AbstractText,
+        source:  'DuckDuckGo'
       });
     }
     for (const topic of (data.RelatedTopics || [])) {
@@ -63,11 +47,67 @@
       results.push({
         title:   topic.Text.split(' - ')[0].substring(0, 80),
         url:     topic.FirstURL,
-        snippet: topic.Text
+        snippet: topic.Text,
+        source:  'DuckDuckGo'
       });
       if (results.length >= topK) break;
     }
     return results;
+  }
+
+  /* ── Layer 2: Wikipedia OpenSearch + Summary ─────────────────────── */
+  async function searchWikipedia(query, topK, lang) {
+    const base = `https://${lang}.wikipedia.org/w/api.php`;
+
+    // Step 1: get matching titles
+    const searchParams = new URLSearchParams({
+      action: 'opensearch', search: query,
+      limit: String(topK), format: 'json', origin: '*'
+    });
+    const sRes = await fetch(`${base}?${searchParams}`);
+    if (!sRes.ok) throw new Error(`Wiki search: ${sRes.status}`);
+    const [, titles, , urls] = await sRes.json();
+    if (!titles.length) return [];
+
+    // Step 2: fetch summary for the top title
+    const summaryParams = new URLSearchParams({
+      action: 'query', titles: titles[0],
+      prop: 'extracts', exintro: '1', explaintext: '1',
+      redirects: '1', format: 'json', origin: '*'
+    });
+    const eRes = await fetch(`${base}?${summaryParams}`);
+    const eData = await eRes.json();
+    const pages = Object.values(eData.query?.pages || {});
+    const extract = pages[0]?.extract || '';
+
+    return titles.slice(0, topK).map((title, i) => ({
+      title,
+      url:     urls[i] || '',
+      snippet: i === 0 ? extract.substring(0, 500) : `Wikipedia article: ${title}`,
+      source:  'Wikipedia'
+    }));
+  }
+
+  /* ── Layer 3: Jina Reader pointed at Google search page ────────────── */
+  async function searchViaJinaReader(query) {
+    // r.jina.ai (Reader) is free, no API key, CORS-safe.
+    // We hand it a Google search URL; it fetches & extracts readable text.
+    const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+    const jinaUrl   = `https://r.jina.ai/${googleUrl}`;
+
+    const res = await fetch(jinaUrl, {
+      headers: { 'Accept': 'text/plain', 'X-Retain-Images': 'none' }
+    });
+    if (!res.ok) throw new Error(`Jina Reader: ${res.status}`);
+    const text = await res.text();
+    if (!text.trim()) throw new Error('Jina returned empty content.');
+
+    return [{
+      title:   `Live web results for: ${query}`,
+      url:     googleUrl,
+      snippet: text.substring(0, 3000),
+      source:  'Jina Reader / Google'
+    }];
   }
 
   /* ── Entry point ─────────────────────────────────────────────────── */
@@ -80,33 +120,56 @@
 
       const query = jsonData.query;
       const topK  = Math.min(jsonData.top_k || 5, 10);
+      const lang  = jsonData.lang || 'en';
 
-      /* Try Jina first — rich results with real URLs */
       let results = [];
+
+      // Layer 1: DDG Instant Answer (great for facts/entities)
       try {
-        results = await searchJina(query, topK);
-      } catch (jinaErr) {
-        console.warn('Jina search failed, trying DDG:', jinaErr.message);
+        results = await searchDDG(query, topK);
+      } catch (e) {
+        console.warn('DDG failed:', e.message);
       }
 
-      /* Fall back to DDG Instant Answer if Jina returned nothing */
-      if (results.length === 0) {
+      // Layer 2: Wikipedia (supplement if DDG returned < 2 results)
+      if (results.length < 2) {
         try {
-          results = await searchDDGInstant(query, topK);
-        } catch (ddgErr) {
-          console.warn('DDG fallback failed:', ddgErr.message);
+          const wikiResults = await searchWikipedia(query, topK, lang);
+          results = [...results, ...wikiResults];
+        } catch (e) {
+          console.warn('Wikipedia failed:', e.message);
         }
       }
 
+      // Layer 3: Jina Reader on Google — always run for news/current queries,
+      // or as last resort if still < 2 results.
+      const newsKeywords = /news|latest|today|current|price|score|weather|2025|2026/i;
+      if (results.length < 2 || newsKeywords.test(query)) {
+        try {
+          const jinaResults = await searchViaJinaReader(query);
+          results = [...results, ...jinaResults];
+        } catch (e) {
+          console.warn('Jina Reader failed:', e.message);
+        }
+      }
+
+      // Deduplicate by URL
+      const seen = new Set();
+      results = results.filter(r => {
+        if (!r.url || seen.has(r.url)) return !r.url;
+        seen.add(r.url);
+        return true;
+      }).slice(0, topK + 2);
+
       if (results.length === 0) {
         return JSON.stringify({
-          error: `No results found for: "${query}". The search APIs may be temporarily unavailable, or try a more specific query.`
+          error: `No results found for: "${query}". All search layers failed. Try a more specific query.`
         });
       }
 
-      const formatted = results
-        .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.snippet}`)
-        .join('\n\n');
+      const formatted = results.map((r, i) =>
+        `[${i + 1}] ${r.title} (${r.source})\nURL: ${r.url}\nSnippet: ${r.snippet}`
+      ).join('\n\n');
 
       return JSON.stringify({
         result: `Search results for: "${query}"\n\n${formatted}`
