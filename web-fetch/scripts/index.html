@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Web Fetch</title>
+</head>
+<body>
+<script>
+  /**
+   * Fetches a URL and returns clean readable text.
+   * Uses allorigins.win as a CORS proxy so the webview can reach any public URL.
+   */
+  async function fetchUrl(url, maxChars) {
+    // Use allorigins as a lightweight CORS proxy
+    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+    const res = await fetch(proxyUrl);
+    if (!res.ok) throw new Error(`Proxy request failed with status ${res.status}`);
+    const json = await res.json();
+    const rawHtml = json.contents;
+    if (!rawHtml) throw new Error('No content returned from proxy.');
+
+    // Parse the HTML and extract readable text
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(rawHtml, 'text/html');
+
+    // Remove noise elements
+    ['script', 'style', 'nav', 'footer', 'header', 'aside', 'noscript', 'iframe'].forEach(tag => {
+      doc.querySelectorAll(tag).forEach(el => el.remove());
+    });
+
+    // Get main content preferring article/main, fallback to body
+    const mainEl = doc.querySelector('article') ||
+                   doc.querySelector('main') ||
+                   doc.querySelector('[role="main"]') ||
+                   doc.body;
+
+    let text = mainEl ? mainEl.innerText || mainEl.textContent : '';
+
+    // Collapse excessive whitespace
+    text = text.replace(/\n{3,}/g, '\n\n').replace(/[ \t]{2,}/g, ' ').trim();
+
+    if (!text) throw new Error('Page was fetched but no readable text was found.');
+
+    // Truncate to save model context
+    if (text.length > maxChars) {
+      text = text.substring(0, maxChars) + '\n\n... [TRUNCATED TO SAVE CONTEXT]';
+    }
+
+    return text;
+  }
+
+  window['ai_edge_gallery_get_result'] = async (data) => {
+    try {
+      const jsonData = JSON.parse(data);
+      if (!jsonData.url) {
+        return JSON.stringify({ error: 'No URL provided.' });
+      }
+
+      const maxChars = jsonData.max_chars || 4000;
+      const text = await fetchUrl(jsonData.url, maxChars);
+
+      return JSON.stringify({ result: text });
+    } catch (e) {
+      console.error(e);
+      return JSON.stringify({ error: `Failed to fetch URL: ${e.message}` });
+    }
+  };
+</script>
+</body>
+</html>

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Web Search</title>
+</head>
+<body>
+<script>
+  /**
+   * Searches using DuckDuckGo Instant Answer API (no API key needed).
+   * Falls back to scraping DuckDuckGo HTML results via allorigins proxy
+   * if the Instant Answer API returns no useful results.
+   */
+
+  async function searchDuckDuckGoInstant(query) {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`DDG API error: ${res.status}`);
+    const data = await res.json();
+
+    const results = [];
+
+    // Abstract (best single answer)
+    if (data.AbstractText) {
+      results.push({
+        title: data.Heading || query,
+        url: data.AbstractURL || '',
+        snippet: data.AbstractText,
+        source: data.AbstractSource || 'DuckDuckGo'
+      });
+    }
+
+    // Related topics
+    if (data.RelatedTopics && data.RelatedTopics.length > 0) {
+      for (const topic of data.RelatedTopics) {
+        if (topic.Text && topic.FirstURL) {
+          results.push({
+            title: topic.Text.split(' - ')[0] || topic.Text.substring(0, 60),
+            url: topic.FirstURL,
+            snippet: topic.Text,
+            source: 'DuckDuckGo'
+          });
+        }
+        // Stop if we have enough
+        if (results.length >= 10) break;
+      }
+    }
+
+    return results;
+  }
+
+  async function searchDuckDuckGoHtml(query, topK) {
+    // Fallback: scrape DuckDuckGo HTML via CORS proxy
+    const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(ddgUrl)}`;
+    const res = await fetch(proxyUrl);
+    if (!res.ok) throw new Error(`Proxy error: ${res.status}`);
+    const json = await res.json();
+    const html = json.contents;
+    if (!html) throw new Error('No HTML returned from proxy.');
+
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+
+    const results = [];
+    const resultEls = doc.querySelectorAll('.result');
+    for (const el of resultEls) {
+      const titleEl = el.querySelector('.result__title a');
+      const snippetEl = el.querySelector('.result__snippet');
+      const urlEl = el.querySelector('.result__url');
+      if (titleEl) {
+        // DDG wraps URLs in a redirect; try to extract the real URL
+        let href = titleEl.href || '';
+        const uddgMatch = href.match(/uddg=([^&]+)/);
+        if (uddgMatch) {
+          try { href = decodeURIComponent(uddgMatch[1]); } catch (e) { /* keep original */ }
+        }
+        results.push({
+          title: titleEl.textContent.trim(),
+          url: href || (urlEl ? urlEl.textContent.trim() : ''),
+          snippet: snippetEl ? snippetEl.textContent.trim() : '',
+          source: 'DuckDuckGo'
+        });
+      }
+      if (results.length >= topK) break;
+    }
+    return results;
+  }
+
+  window['ai_edge_gallery_get_result'] = async (data) => {
+    try {
+      const jsonData = JSON.parse(data);
+      if (!jsonData.query) {
+        return JSON.stringify({ error: 'No search query provided.' });
+      }
+
+      const query = jsonData.query;
+      const topK = jsonData.top_k || 5;
+
+      // Try Instant Answer API first (no key needed)
+      let results = await searchDuckDuckGoInstant(query);
+
+      // If not enough results, fall back to HTML scraping
+      if (results.length < 2) {
+        results = await searchDuckDuckGoHtml(query, topK);
+      }
+
+      // Trim to requested count
+      results = results.slice(0, topK);
+
+      if (results.length === 0) {
+        return JSON.stringify({ error: `No results found for: "${query}". Try a more specific or different query.` });
+      }
+
+      // Format as structured text for the model
+      const formatted = results.map((r, i) =>
+        `[${i + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.snippet}`
+      ).join('\n\n');
+
+      const resultText = `Search results for: "${query}"\n\n${formatted}`;
+
+      return JSON.stringify({ result: resultText });
+    } catch (e) {
+      console.error(e);
+      return JSON.stringify({ error: `Search failed: ${e.message}` });
+    }
+  };
+</script>
+</body>
+</html>
