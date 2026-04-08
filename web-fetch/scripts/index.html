@@ -7,45 +7,57 @@
 <body>
 <script>
   /**
-   * Fetches a URL and returns clean readable text.
-   * Uses allorigins.win as a CORS proxy so the webview can reach any public URL.
+   * Web Fetch skill for AI Edge Gallery.
+   *
+   * Uses Jina AI Reader API (r.jina.ai) — CORS-safe, no API key required.
+   * Converts any public URL into clean Markdown text, perfect for LLM context.
+   *
+   * Accept: application/json returns structured { data: { title, url, content } }.
+   * Fallback: plain text mode if JSON mode fails.
    */
-  async function fetchUrl(url, maxChars) {
-    // Use allorigins as a lightweight CORS proxy
-    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
-    const res = await fetch(proxyUrl);
-    if (!res.ok) throw new Error(`Proxy request failed with status ${res.status}`);
-    const json = await res.json();
-    const rawHtml = json.contents;
-    if (!rawHtml) throw new Error('No content returned from proxy.');
 
-    // Parse the HTML and extract readable text
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(rawHtml, 'text/html');
+  async function fetchWithJina(url, maxChars) {
+    const jinaUrl = `https://r.jina.ai/${url}`;
 
-    // Remove noise elements
-    ['script', 'style', 'nav', 'footer', 'header', 'aside', 'noscript', 'iframe'].forEach(tag => {
-      doc.querySelectorAll(tag).forEach(el => el.remove());
+    /* Try JSON mode first for structured output */
+    let res = await fetch(jinaUrl, {
+      headers: {
+        'Accept': 'application/json',
+        'X-Retain-Images': 'none',
+        'X-Remove-Selector': 'header,footer,nav,aside'
+      }
     });
 
-    // Get main content preferring article/main, fallback to body
-    const mainEl = doc.querySelector('article') ||
-                   doc.querySelector('main') ||
-                   doc.querySelector('[role="main"]') ||
-                   doc.body;
+    if (res.ok) {
+      const json = await res.json();
+      const item = json.data || json;
+      let text = item.content || item.text || '';
+      const title = item.title || '';
+      if (!text) throw new Error('Jina returned empty content.');
 
-    let text = mainEl ? mainEl.innerText || mainEl.textContent : '';
+      // Prepend title for context
+      if (title) text = `# ${title}\n\n${text}`;
 
-    // Collapse excessive whitespace
-    text = text.replace(/\n{3,}/g, '\n\n').replace(/[ \t]{2,}/g, ' ').trim();
+      if (text.length > maxChars) {
+        text = text.substring(0, maxChars) + '\n\n... [TRUNCATED TO SAVE CONTEXT]';
+      }
+      return text;
+    }
 
-    if (!text) throw new Error('Page was fetched but no readable text was found.');
+    /* Fallback: plain text mode */
+    res = await fetch(jinaUrl, {
+      headers: {
+        'Accept': 'text/plain',
+        'X-Retain-Images': 'none'
+      }
+    });
+    if (!res.ok) throw new Error(`Jina Reader error: ${res.status} ${res.statusText}`);
+    let text = await res.text();
+    if (!text.trim()) throw new Error('Page returned empty content.');
 
-    // Truncate to save model context
     if (text.length > maxChars) {
       text = text.substring(0, maxChars) + '\n\n... [TRUNCATED TO SAVE CONTEXT]';
     }
-
     return text;
   }
 
@@ -53,11 +65,16 @@
     try {
       const jsonData = JSON.parse(data);
       if (!jsonData.url) {
-        return JSON.stringify({ error: 'No URL provided.' });
+        return JSON.stringify({ error: 'No URL provided. Please supply a full URL starting with https://' });
       }
 
-      const maxChars = jsonData.max_chars || 4000;
-      const text = await fetchUrl(jsonData.url, maxChars);
+      const targetUrl = jsonData.url.trim();
+      if (!/^https?:\/\//i.test(targetUrl)) {
+        return JSON.stringify({ error: `Invalid URL: "${targetUrl}". URL must start with http:// or https://` });
+      }
+
+      const maxChars = Math.min(jsonData.max_chars || 4000, 8000);
+      const text = await fetchWithJina(targetUrl, maxChars);
 
       return JSON.stringify({ result: text });
     } catch (e) {

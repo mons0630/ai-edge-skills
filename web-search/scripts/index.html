@@ -7,86 +7,70 @@
 <body>
 <script>
   /**
-   * Searches using DuckDuckGo Instant Answer API (no API key needed).
-   * Falls back to scraping DuckDuckGo HTML results via allorigins proxy
-   * if the Instant Answer API returns no useful results.
+   * Web Search skill for AI Edge Gallery.
+   *
+   * Strategy (all CORS-safe, no API key required):
+   *   1. Jina AI Search API  (s.jina.ai) — returns structured Markdown
+   *      with titles, URLs and summaries for the top results.
+   *   2. DuckDuckGo Instant Answer API — JSONP-style, works from browser
+   *      when the &callback= param is omitted and origin is trusted.
+   *      Used as a lightweight fallback for factual/entity queries.
+   *
+   * Both endpoints respond with Access-Control-Allow-Origin: *
    */
 
-  async function searchDuckDuckGoInstant(query) {
+  /* ── 1. Jina Search (primary) ─────────────────────────────────────── */
+  async function searchJina(query, topK) {
+    // s.jina.ai wraps a Google search and returns clean Markdown.
+    // Accept: application/json returns structured JSON instead of Markdown.
+    const url = `https://s.jina.ai/${encodeURIComponent(query)}`;
+    const res = await fetch(url, {
+      headers: {
+        'Accept': 'application/json',
+        'X-Retain-Images': 'none',
+        'X-No-Cache': 'true'
+      }
+    });
+    if (!res.ok) throw new Error(`Jina Search error: ${res.status}`);
+    const data = await res.json();
+
+    // Jina returns { data: [ { title, url, description, content }, ... ] }
+    const items = (data.data || []).slice(0, topK);
+    return items.map(item => ({
+      title:   item.title   || '(no title)',
+      url:     item.url     || '',
+      snippet: item.description || (item.content || '').substring(0, 300)
+    }));
+  }
+
+  /* ── 2. DuckDuckGo Instant Answer (fallback) ──────────────────────── */
+  async function searchDDGInstant(query, topK) {
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`DDG API error: ${res.status}`);
     const data = await res.json();
 
     const results = [];
-
-    // Abstract (best single answer)
     if (data.AbstractText) {
       results.push({
-        title: data.Heading || query,
-        url: data.AbstractURL || '',
-        snippet: data.AbstractText,
-        source: data.AbstractSource || 'DuckDuckGo'
+        title:   data.Heading || query,
+        url:     data.AbstractURL || '',
+        snippet: data.AbstractText
       });
     }
-
-    // Related topics
-    if (data.RelatedTopics && data.RelatedTopics.length > 0) {
-      for (const topic of data.RelatedTopics) {
-        if (topic.Text && topic.FirstURL) {
-          results.push({
-            title: topic.Text.split(' - ')[0] || topic.Text.substring(0, 60),
-            url: topic.FirstURL,
-            snippet: topic.Text,
-            source: 'DuckDuckGo'
-          });
-        }
-        // Stop if we have enough
-        if (results.length >= 10) break;
-      }
-    }
-
-    return results;
-  }
-
-  async function searchDuckDuckGoHtml(query, topK) {
-    // Fallback: scrape DuckDuckGo HTML via CORS proxy
-    const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(ddgUrl)}`;
-    const res = await fetch(proxyUrl);
-    if (!res.ok) throw new Error(`Proxy error: ${res.status}`);
-    const json = await res.json();
-    const html = json.contents;
-    if (!html) throw new Error('No HTML returned from proxy.');
-
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, 'text/html');
-
-    const results = [];
-    const resultEls = doc.querySelectorAll('.result');
-    for (const el of resultEls) {
-      const titleEl = el.querySelector('.result__title a');
-      const snippetEl = el.querySelector('.result__snippet');
-      const urlEl = el.querySelector('.result__url');
-      if (titleEl) {
-        // DDG wraps URLs in a redirect; try to extract the real URL
-        let href = titleEl.href || '';
-        const uddgMatch = href.match(/uddg=([^&]+)/);
-        if (uddgMatch) {
-          try { href = decodeURIComponent(uddgMatch[1]); } catch (e) { /* keep original */ }
-        }
-        results.push({
-          title: titleEl.textContent.trim(),
-          url: href || (urlEl ? urlEl.textContent.trim() : ''),
-          snippet: snippetEl ? snippetEl.textContent.trim() : '',
-          source: 'DuckDuckGo'
-        });
-      }
+    for (const topic of (data.RelatedTopics || [])) {
+      if (!topic.Text || !topic.FirstURL) continue;
+      results.push({
+        title:   topic.Text.split(' - ')[0].substring(0, 80),
+        url:     topic.FirstURL,
+        snippet: topic.Text
+      });
       if (results.length >= topK) break;
     }
     return results;
   }
 
+  /* ── Entry point ─────────────────────────────────────────────────── */
   window['ai_edge_gallery_get_result'] = async (data) => {
     try {
       const jsonData = JSON.parse(data);
@@ -95,31 +79,39 @@
       }
 
       const query = jsonData.query;
-      const topK = jsonData.top_k || 5;
+      const topK  = Math.min(jsonData.top_k || 5, 10);
 
-      // Try Instant Answer API first (no key needed)
-      let results = await searchDuckDuckGoInstant(query);
-
-      // If not enough results, fall back to HTML scraping
-      if (results.length < 2) {
-        results = await searchDuckDuckGoHtml(query, topK);
+      /* Try Jina first — rich results with real URLs */
+      let results = [];
+      try {
+        results = await searchJina(query, topK);
+      } catch (jinaErr) {
+        console.warn('Jina search failed, trying DDG:', jinaErr.message);
       }
 
-      // Trim to requested count
-      results = results.slice(0, topK);
+      /* Fall back to DDG Instant Answer if Jina returned nothing */
+      if (results.length === 0) {
+        try {
+          results = await searchDDGInstant(query, topK);
+        } catch (ddgErr) {
+          console.warn('DDG fallback failed:', ddgErr.message);
+        }
+      }
 
       if (results.length === 0) {
-        return JSON.stringify({ error: `No results found for: "${query}". Try a more specific or different query.` });
+        return JSON.stringify({
+          error: `No results found for: "${query}". The search APIs may be temporarily unavailable, or try a more specific query.`
+        });
       }
 
-      // Format as structured text for the model
-      const formatted = results.map((r, i) =>
-        `[${i + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.snippet}`
-      ).join('\n\n');
+      const formatted = results
+        .map((r, i) => `[${i + 1}] ${r.title}\nURL: ${r.url}\nSnippet: ${r.snippet}`)
+        .join('\n\n');
 
-      const resultText = `Search results for: "${query}"\n\n${formatted}`;
+      return JSON.stringify({
+        result: `Search results for: "${query}"\n\n${formatted}`
+      });
 
-      return JSON.stringify({ result: resultText });
     } catch (e) {
       console.error(e);
       return JSON.stringify({ error: `Search failed: ${e.message}` });
